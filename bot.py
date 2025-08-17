@@ -3,6 +3,9 @@ from eth_account import Account
 from colorama import Fore, Style
 from datetime import datetime, timedelta
 import pytz, asyncio, json, os, random
+import re
+from aiohttp import ClientSession, ClientTimeout
+from aiohttp_socks import ProxyConnector
 
 wib = pytz.timezone('Asia/Singapore')
 
@@ -128,6 +131,10 @@ class KiteAi:
 
         self.kite_swap_amount = 0
         self.usdt_swap_amount = 0
+        self.proxies = []
+        self.proxy_index = 0
+        self.account_proxies = {}
+        self.config_file = "config.json"
 
     def log(self, message):
         print(
@@ -136,17 +143,121 @@ class KiteAi:
             flush=True
         )
 
-    async def get_web3_with_check(self, address: str, rpc_url: str):
+    async def load_proxies(self, use_proxy_choice: int):
+        filename = "proxy.txt"
         try:
-            web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 60}))
-            web3.eth.get_block_number()
-            return web3
-        except Exception as e:
-            raise Exception(f"Failed to Connect to RPC: {str(e)}")
+            if use_proxy_choice == 1:
+                async with ClientSession(timeout=ClientTimeout(total=30)) as session:
+                    async with session.get("https://raw.githubusercontent.com/monosans/proxy-list/refs/heads/main/proxies/all.txt") as response:
+                        response.raise_for_status()
+                        content = await response.text()
+                        with open(filename, 'w') as f:
+                            f.write(content)
+                        self.proxies = [line.strip() for line in content.splitlines() if line.strip()]
+            else:
+                if not os.path.exists(filename):
+                    self.log(f"{Fore.RED + Style.BRIGHT}File {filename} Not Found.{Style.RESET_ALL}")
+                    return
+                with open(filename, 'r') as f:
+                    self.proxies = [line.strip() for line in f.read().splitlines() if line.strip()]
 
-    async def get_token_balance(self, address: str, contract_address: str, token_type: str):
+            if not self.proxies:
+                self.log(f"{Fore.RED + Style.BRIGHT}No Proxies Found.{Style.RESET_ALL}")
+                return
+
+            self.log(
+                f"{Fore.GREEN + Style.BRIGHT}Proxies Total  : {Style.RESET_ALL}"
+                f"{Fore.WHITE + Style.BRIGHT}{len(self.proxies)}{Style.RESET_ALL}"
+            )
+
+        except Exception as e:
+            self.log(f"{Fore.RED + Style.BRIGHT}Failed To Load Proxies: {e}{Style.RESET_ALL}")
+            self.proxies = []
+
+    def check_proxy_schemes(self, proxies):
+        schemes = ["http://", "https://", "socks4://", "socks5://"]
+        if any(proxies.startswith(scheme) for scheme in schemes):
+            return proxies
+        return f"http://{proxies}"
+
+    def get_next_proxy_for_account(self, account):
+        if account not in self.account_proxies:
+            if not self.proxies:
+                return None
+            proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+            self.account_proxies[account] = proxy
+            self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        return self.account_proxies[account]
+
+    def rotate_proxy_for_account(self, account):
+        if not self.proxies:
+            return None
+        proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+        self.account_proxies[account] = proxy
+        self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
+        return proxy
+
+    def get_proxy_settings(self):
+        while True:
+            try:
+                print(f"{Fore.WHITE + Style.BRIGHT}1. Run With Proxyscrape Free Proxy{Style.RESET_ALL}")
+                print(f"{Fore.WHITE + Style.BRIGHT}2. Run With Private Proxy{Style.RESET_ALL}")
+                print(f"{Fore.WHITE + Style.BRIGHT}3. Run Without Proxy{Style.RESET_ALL}")
+                choose = int(input(f"{Fore.BLUE + Style.BRIGHT}Choose [1/2/3] -> {Style.RESET_ALL}").strip())
+
+                if choose in [1, 2, 3]:
+                    proxy_type = (
+                        "With Proxyscrape Free" if choose == 1 else
+                        "With Private" if choose == 2 else
+                        "Without"
+                    )
+                    print(f"{Fore.GREEN + Style.BRIGHT}Run {proxy_type} Proxy Selected.{Style.RESET_ALL}")
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Please enter either 1, 2 or 3.{Style.RESET_ALL}")
+            except ValueError:
+                print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter a number (1, 2 or 3).{Style.RESET_ALL}")
+
+        rotate = False
+        if choose in [1, 2]:
+            while True:
+                rotate = input(f"{Fore.BLUE + Style.BRIGHT}Rotate Invalid Proxy? [y/n] -> {Style.RESET_ALL}").strip()
+                if rotate in ["y", "n"]:
+                    rotate = rotate == "y"
+                    break
+                else:
+                    print(f"{Fore.RED + Style.BRIGHT}Invalid input. Enter 'y' or 'n'.{Style.RESET_ALL}")
+
+        return choose, rotate
+
+    async def get_web3_with_check(self, address: str, rpc_url: str, use_proxy: bool, retries=3, timeout=60):
+        request_kwargs = {"timeout": timeout}
+        proxy = self.get_next_proxy_for_account(address) if use_proxy else None
+
+        if use_proxy and proxy:
+            if proxy.startswith("socks"):
+                connector = ProxyConnector.from_url(proxy)
+                request_kwargs["connector"] = connector
+            else:
+                request_kwargs["proxy"] = proxy
+
+        for attempt in range(retries):
+            try:
+                web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
+                web3.eth.get_block_number()
+                return web3
+            except Exception as e:
+                if use_proxy and self.rotate_proxy:
+                    self.rotate_proxy_for_account(address)
+                    request_kwargs["proxy"] = self.get_next_proxy_for_account(address)
+                if attempt < retries - 1:
+                    await asyncio.sleep(3)
+                    continue
+                raise Exception(f"Failed to Connect to RPC: {str(e)}")
+
+    async def get_token_balance(self, address: str, contract_address: str, token_type: str, use_proxy: bool):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"])
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
             if token_type == "native":
                 balance = web3.eth.get_balance(address)
                 decimals = 18
@@ -181,9 +292,9 @@ class KiteAi:
                 await asyncio.sleep(2 ** attempt)
         raise Exception("Receipt Not Found After Retries")
 
-    async def approving_token(self, account: str, address: str, spender_address: str, contract_address: str, amount_to_wei: int):
+    async def approving_token(self, account: str, address: str, spender_address: str, contract_address: str, amount_to_wei: int, use_proxy: bool):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"])
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
             token_contract = web3.eth.contract(address=web3.to_checksum_address(contract_address), abi=self.ERC20_CONTRACT_ABI)
             allowance = token_contract.functions.allowance(address, spender_address).call()
             if allowance < amount_to_wei:
@@ -235,16 +346,16 @@ class KiteAi:
         except Exception as e:
             raise Exception(f"Build Instructions Failed: {str(e)}")
 
-    async def perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float):
+    async def perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, use_proxy: bool):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"])
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
             amount_to_wei = web3.to_wei(amount, "ether")
             token_contract = web3.eth.contract(
                 address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS),
                 abi=self.NATIVE_CONTRACT_ABI if swap_type == "native to erc20" else self.ERC20_CONTRACT_ABI
             )
             if swap_type == "erc20 to native":
-                await self.approving_token(account, address, self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei)
+                await self.approving_token(account, address, self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei, use_proxy)
             instructions = self.build_instructions_data(address, swap_type, token_in, token_out)
             token_address = self.ZERO_CONTRACT_ADDRESS if swap_type == "native to erc20" else token_in
             swap_data = token_contract.functions.initiate(token_address, amount_to_wei, instructions)
@@ -266,7 +377,7 @@ class KiteAi:
             self.log(f"{Fore.RED+Style.BRIGHT}Swap Failed: {str(e)}{Style.RESET_ALL}")
             return None, None
 
-    async def process_swap(self, account: str, address: str, swap_count: int):
+    async def process_swap(self, account: str, address: str, swap_count: int, use_proxy: bool):
         self.log(f"{Fore.CYAN+Style.BRIGHT}Swap      :{Style.RESET_ALL}")
         for i in range(swap_count):
             self.log(
@@ -281,7 +392,7 @@ class KiteAi:
             token_type = "native"
             amount = self.kite_swap_amount
             
-            balance = await self.get_token_balance(address, token_in, token_type)
+            balance = await self.get_token_balance(address, token_in, token_type, use_proxy)
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}     Pair    :{Style.RESET_ALL}"
                 f"{Fore.BLUE+Style.BRIGHT} {option}{Style.RESET_ALL}"
@@ -300,7 +411,7 @@ class KiteAi:
                     f"{Fore.YELLOW+Style.BRIGHT} Insufficient {ticker} Balance{Style.RESET_ALL}"
                 )
                 continue
-            tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount)
+            tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount, use_proxy)
             if tx_hash and block_number:
                 self.log(
                     f"{Fore.CYAN+Style.BRIGHT}     Status  :{Style.RESET_ALL}"
@@ -320,7 +431,7 @@ class KiteAi:
                 )
             await asyncio.sleep(random.randint(5, 10))
 
-    async def run_swaps(self, kite_swap_amount: float, swap_count: int):
+    async def run_swaps(self, kite_swap_amount: float, swap_count: int, use_proxy: bool):
         try:
             with open('accounts.txt', 'r') as file:
                 accounts = [line.strip() for line in file if line.strip()]
@@ -328,7 +439,7 @@ class KiteAi:
             for account in accounts:
                 address = Account.from_key(account).address
                 self.log(f"{Fore.CYAN+Style.BRIGHT}===== [{address[:6]}...{address[-6:]}] ====={Style.RESET_ALL}")
-                await self.process_swap(account, address, swap_count)
+                await self.process_swap(account, address, swap_count, use_proxy)
         except FileNotFoundError:
             self.log(f"{Fore.RED+Style.BRIGHT}File 'accounts.txt' Not Found{Style.RESET_ALL}")
         except Exception as e:
@@ -339,13 +450,13 @@ class KiteAi:
             "kite_swap_amount": kite_swap_amount,
             "swap_count": swap_count
         }
-        with open('config.json', 'w') as f:
+        with open(self.config_file, 'w') as f:
             json.dump(config, f, indent=4)
-        self.log(f"{Fore.GREEN+Style.BRIGHT}Configuration saved to config.json{Style.RESET_ALL}")
+        self.log(f"{Fore.GREEN+Style.BRIGHT}Configuration saved to {self.config_file}{Style.RESET_ALL}")
 
     def load_config(self):
         try:
-            with open('config.json', 'r') as f:
+            with open(self.config_file, 'r') as f:
                 config = json.load(f)
                 return config.get("kite_swap_amount", 0), config.get("swap_count", 0)
         except FileNotFoundError:
@@ -361,7 +472,14 @@ class KiteAi:
 
     async def main(self):
         try:
-            self.log(f"{Fore.YELLOW+Style.BRIGHT}===== KiteAi_Swap - Tesseract Bot ====={Style.RESET_ALL}")
+            self.log(f"{Fore.YELLOW+Style.BRIGHT}===== KiteAi_Swap - Tesseract Bot =====(Bamar Airdrop Group){Style.RESET_ALL}")
+
+            
+            use_proxy_choice, self.rotate_proxy = self.get_proxy_settings()
+            if use_proxy_choice in [1, 2]:
+                await self.load_proxies(use_proxy_choice)
+            use_proxy = use_proxy_choice in [1, 2]
+
             
             kite_swap_amount, swap_count = self.load_config()
             if kite_swap_amount == 0 or swap_count == 0:
@@ -374,7 +492,7 @@ class KiteAi:
 
             while True:
                 
-                await self.run_swaps(kite_swap_amount, swap_count)
+                await self.run_swaps(kite_swap_amount, swap_count, use_proxy)
                 
                 
                 next_run = datetime.now(wib) + timedelta(hours=24)
