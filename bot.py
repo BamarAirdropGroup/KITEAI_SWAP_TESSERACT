@@ -4,8 +4,7 @@ from colorama import Fore, Style
 from datetime import datetime, timedelta
 import pytz, asyncio, json, os, random
 import re
-from aiohttp import ClientSession, ClientTimeout
-from aiohttp_socks import ProxyConnector
+import requests
 
 wib = pytz.timezone('Asia/Singapore')
 
@@ -135,6 +134,7 @@ class KiteAi:
         self.proxy_index = 0
         self.account_proxies = {}
         self.config_file = "config.json"
+        self.rotate_proxy = False
 
     def log(self, message):
         print(
@@ -143,17 +143,34 @@ class KiteAi:
             flush=True
         )
 
+    def parse_proxy(self, proxy_str):
+        """Parse proxy string to extract scheme, host, port, username, and password."""
+        proxy_regex = r'^(?:(socks[45]|http|https)://)?(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$'
+        match = re.match(proxy_regex, proxy_str)
+        if not match:
+            proxy_str = f"http://{proxy_str}"  
+            match = re.match(proxy_regex, proxy_str)
+        if match:
+            scheme, username, password, host, port = match.groups()
+            return {
+                "scheme": scheme or "http",
+                "host": host,
+                "port": int(port),
+                "username": username,
+                "password": password
+            }
+        raise ValueError(f"Invalid proxy format: {proxy_str}")
+
     async def load_proxies(self, use_proxy_choice: int):
         filename = "proxy.txt"
         try:
             if use_proxy_choice == 1:
-                async with ClientSession(timeout=ClientTimeout(total=30)) as session:
-                    async with session.get("https://raw.githubusercontent.com/monosans/proxy-list/refs/heads/main/proxies/all.txt") as response:
-                        response.raise_for_status()
-                        content = await response.text()
-                        with open(filename, 'w') as f:
-                            f.write(content)
-                        self.proxies = [line.strip() for line in content.splitlines() if line.strip()]
+                response = requests.get("https://raw.githubusercontent.com/monosans/proxy-list/refs/heads/main/proxies/all.txt", timeout=30)
+                response.raise_for_status()
+                content = response.text
+                with open(filename, 'w') as f:
+                    f.write(content)
+                self.proxies = [line.strip() for line in content.splitlines() if line.strip()]
             else:
                 if not os.path.exists(filename):
                     self.log(f"{Fore.RED + Style.BRIGHT}File {filename} Not Found.{Style.RESET_ALL}")
@@ -166,7 +183,7 @@ class KiteAi:
                 return
 
             self.log(
-                f"{Fore.GREEN + Style.BRIGHT}Proxies Total  : {Style.RESET_ALL}"
+                f"{Fore.GREEN + Style.BRIGHT}Proxies Total: {Style.RESET_ALL}"
                 f"{Fore.WHITE + Style.BRIGHT}{len(self.proxies)}{Style.RESET_ALL}"
             )
 
@@ -174,17 +191,11 @@ class KiteAi:
             self.log(f"{Fore.RED + Style.BRIGHT}Failed To Load Proxies: {e}{Style.RESET_ALL}")
             self.proxies = []
 
-    def check_proxy_schemes(self, proxies):
-        schemes = ["http://", "https://", "socks4://", "socks5://"]
-        if any(proxies.startswith(scheme) for scheme in schemes):
-            return proxies
-        return f"http://{proxies}"
-
     def get_next_proxy_for_account(self, account):
         if account not in self.account_proxies:
             if not self.proxies:
                 return None
-            proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+            proxy = self.proxies[self.proxy_index]
             self.account_proxies[account] = proxy
             self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
         return self.account_proxies[account]
@@ -192,7 +203,7 @@ class KiteAi:
     def rotate_proxy_for_account(self, account):
         if not self.proxies:
             return None
-        proxy = self.check_proxy_schemes(self.proxies[self.proxy_index])
+        proxy = self.proxies[self.proxy_index]
         self.account_proxies[account] = proxy
         self.proxy_index = (self.proxy_index + 1) % len(self.proxies)
         return proxy
@@ -231,43 +242,58 @@ class KiteAi:
         return choose, rotate
 
     async def get_web3_with_check(self, address: str, rpc_url: str, use_proxy: bool, retries=3, timeout=60):
-        request_kwargs = {"timeout": timeout}
-        proxy = self.get_next_proxy_for_account(address) if use_proxy else None
-
-        if use_proxy and proxy:
-            if proxy.startswith("socks"):
-                connector = ProxyConnector.from_url(proxy)
-                request_kwargs["connector"] = connector
-            else:
-                request_kwargs["proxy"] = proxy
-
         for attempt in range(retries):
             try:
-                web3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs=request_kwargs))
-                web3.eth.get_block_number()
+                proxy = self.get_next_proxy_for_account(address) if use_proxy else None
+                session = None
+
+                if use_proxy and proxy:
+                    proxy_info = self.parse_proxy(proxy)
+                    scheme = proxy_info["scheme"].lower()
+                    self.log(f"{Fore.CYAN + Style.BRIGHT}Using proxy: {proxy} (Scheme: {scheme}){Style.RESET_ALL}")
+                    proxy_url = f"{scheme}://{proxy_info['host']}:{proxy_info['port']}"
+                    if proxy_info["username"] and proxy_info["password"]:
+                        proxy_url = f"{scheme}://{proxy_info['username']}:{proxy_info['password']}@{proxy_info['host']}:{proxy_info['port']}"
+                    session = requests.Session()
+                    session.proxies = {
+                        "http": proxy_url if scheme in ["http", "socks4", "socks5"] else None,
+                        "https": proxy_url if scheme in ["https", "socks4", "socks5"] else None
+                    }
+                    session.timeout = timeout
+                else:
+                    self.log(f"{Fore.CYAN + Style.BRIGHT}Using direct connection (no proxy){Style.RESET_ALL}")
+                    session = requests.Session()
+                    session.timeout = timeout
+
+                web3 = Web3(Web3.HTTPProvider(rpc_url, session=session))
+                await asyncio.to_thread(web3.eth.get_block_number)
+                self.log(f"{Fore.GREEN + Style.BRIGHT}Successfully connected to RPC{' via proxy' if use_proxy else ''}{Style.RESET_ALL}")
                 return web3
             except Exception as e:
+                self.log(f"{Fore.RED + Style.BRIGHT}RPC Connection Attempt {attempt + 1}/{retries} Failed: {str(e)}{Style.RESET_ALL}")
                 if use_proxy and self.rotate_proxy:
                     self.rotate_proxy_for_account(address)
-                    request_kwargs["proxy"] = self.get_next_proxy_for_account(address)
                 if attempt < retries - 1:
                     await asyncio.sleep(3)
                     continue
                 raise Exception(f"Failed to Connect to RPC: {str(e)}")
+            finally:
+                if session:
+                    session.close()
 
-    async def get_token_balance(self, address: str, contract_address: str, token_type: str, use_proxy: bool):
+    async def get_token_balance(self, address: str, contract_address: str, token_type: str, use_proxy: bool = True):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy=True)  # Use proxy
             if token_type == "native":
-                balance = web3.eth.get_balance(address)
+                balance = await asyncio.to_thread(web3.eth.get_balance, address)
                 decimals = 18
             else:
                 token_contract = web3.eth.contract(
                     address=web3.to_checksum_address(contract_address),
                     abi=self.ERC20_CONTRACT_ABI
                 )
-                balance = token_contract.functions.balanceOf(address).call()
-                decimals = token_contract.functions.decimals().call()
+                balance = await asyncio.to_thread(token_contract.functions.balanceOf(address).call)
+                decimals = await asyncio.to_thread(token_contract.functions.decimals().call)
             return balance / (10 ** decimals)
         except Exception as e:
             self.log(f"{Fore.RED+Style.BRIGHT}Balance Check Failed: {str(e)}{Style.RESET_ALL}")
@@ -277,9 +303,10 @@ class KiteAi:
         for attempt in range(retries):
             try:
                 signed_tx = web3.eth.account.sign_transaction(tx, account)
-                raw_tx = web3.eth.send_raw_transaction(signed_tx.raw_transaction)
+                raw_tx = await asyncio.to_thread(web3.eth.send_raw_transaction, signed_tx.raw_transaction)
                 return web3.to_hex(raw_tx)
-            except Exception:
+            except Exception as e:
+                self.log(f"{Fore.RED+Style.BRIGHT}Transaction Attempt {attempt + 1}/{retries} Failed: {str(e)}{Style.RESET_ALL}")
                 await asyncio.sleep(2 ** attempt)
         raise Exception("Transaction Failed After Retries")
 
@@ -288,25 +315,26 @@ class KiteAi:
             try:
                 receipt = await asyncio.to_thread(web3.eth.wait_for_transaction_receipt, tx_hash, timeout=300)
                 return receipt
-            except Exception:
+            except Exception as e:
+                self.log(f"{Fore.RED+Style.BRIGHT}Receipt Attempt {attempt + 1}/{retries} Failed: {str(e)}{Style.RESET_ALL}")
                 await asyncio.sleep(2 ** attempt)
         raise Exception("Receipt Not Found After Retries")
 
     async def approving_token(self, account: str, address: str, spender_address: str, contract_address: str, amount_to_wei: int, use_proxy: bool):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy=True)  # Use proxy
             token_contract = web3.eth.contract(address=web3.to_checksum_address(contract_address), abi=self.ERC20_CONTRACT_ABI)
-            allowance = token_contract.functions.allowance(address, spender_address).call()
+            allowance = await asyncio.to_thread(token_contract.functions.allowance(address, spender_address).call)
             if allowance < amount_to_wei:
                 approve_data = token_contract.functions.approve(spender_address, amount_to_wei)
-                estimated_gas = approve_data.estimate_gas({"from": address})
+                estimated_gas = await asyncio.to_thread(approve_data.estimate_gas, {"from": address})
                 max_priority_fee = web3.to_wei(0.001, "gwei")
-                approve_tx = approve_data.build_transaction({
+                approve_tx = await asyncio.to_thread(approve_data.build_transaction, {
                     "from": address,
                     "gas": int(estimated_gas * 1.2),
                     "maxFeePerGas": max_priority_fee,
                     "maxPriorityFeePerGas": max_priority_fee,
-                    "nonce": web3.eth.get_transaction_count(address, "pending"),
+                    "nonce": await asyncio.to_thread(web3.eth.get_transaction_count, address, "pending"),
                     "chainId": web3.eth.chain_id,
                 })
                 tx_hash = await self.send_raw_transaction_with_retries(account, web3, approve_tx)
@@ -348,26 +376,26 @@ class KiteAi:
 
     async def perform_swap(self, account: str, address: str, swap_type: str, token_in: str, token_out: str, amount: float, use_proxy: bool):
         try:
-            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy)
+            web3 = await self.get_web3_with_check(address, self.KITE_AI["rpc_url"], use_proxy=True)  
             amount_to_wei = web3.to_wei(amount, "ether")
             token_contract = web3.eth.contract(
                 address=web3.to_checksum_address(self.SWAP_ROUTER_ADDRESS),
                 abi=self.NATIVE_CONTRACT_ABI if swap_type == "native to erc20" else self.ERC20_CONTRACT_ABI
             )
             if swap_type == "erc20 to native":
-                await self.approving_token(account, address, self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei, use_proxy)
+                await self.approving_token(account, address, self.SWAP_ROUTER_ADDRESS, token_in, amount_to_wei, use_proxy=True)
             instructions = self.build_instructions_data(address, swap_type, token_in, token_out)
             token_address = self.ZERO_CONTRACT_ADDRESS if swap_type == "native to erc20" else token_in
             swap_data = token_contract.functions.initiate(token_address, amount_to_wei, instructions)
             max_priority_fee = web3.to_wei(0.001, "gwei")
-            estimated_gas = swap_data.estimate_gas({"from": address, "value": amount_to_wei} if swap_type == "native to erc20" else {"from": address})
-            swap_tx = swap_data.build_transaction({
+            estimated_gas = await asyncio.to_thread(swap_data.estimate_gas, {"from": address, "value": amount_to_wei} if swap_type == "native to erc20" else {"from": address})
+            swap_tx = await asyncio.to_thread(swap_data.build_transaction, {
                 "from": address,
                 "value": amount_to_wei if swap_type == "native to erc20" else 0,
                 "gas": int(estimated_gas * 1.2),
                 "maxFeePerGas": max_priority_fee,
                 "maxPriorityFeePerGas": max_priority_fee,
-                "nonce": web3.eth.get_transaction_count(address, "pending"),
+                "nonce": await asyncio.to_thread(web3.eth.get_transaction_count, address, "pending"),
                 "chainId": web3.eth.chain_id,
             })
             tx_hash = await self.send_raw_transaction_with_retries(account, web3, swap_tx)
@@ -392,7 +420,7 @@ class KiteAi:
             token_type = "native"
             amount = self.kite_swap_amount
             
-            balance = await self.get_token_balance(address, token_in, token_type, use_proxy)
+            balance = await self.get_token_balance(address, token_in, token_type, use_proxy=True)  
             self.log(
                 f"{Fore.CYAN+Style.BRIGHT}     Pair    :{Style.RESET_ALL}"
                 f"{Fore.BLUE+Style.BRIGHT} {option}{Style.RESET_ALL}"
@@ -411,7 +439,7 @@ class KiteAi:
                     f"{Fore.YELLOW+Style.BRIGHT} Insufficient {ticker} Balance{Style.RESET_ALL}"
                 )
                 continue
-            tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount, use_proxy)
+            tx_hash, block_number = await self.perform_swap(account, address, swap_type, token_in, token_out, amount, use_proxy=True)  # Use proxy
             if tx_hash and block_number:
                 self.log(
                     f"{Fore.CYAN+Style.BRIGHT}     Status  :{Style.RESET_ALL}"
@@ -474,13 +502,11 @@ class KiteAi:
         try:
             self.log(f"{Fore.YELLOW+Style.BRIGHT}===== KiteAi_Swap - Tesseract Bot =====(Bamar Airdrop Group){Style.RESET_ALL}")
 
-            
             use_proxy_choice, self.rotate_proxy = self.get_proxy_settings()
             if use_proxy_choice in [1, 2]:
                 await self.load_proxies(use_proxy_choice)
             use_proxy = use_proxy_choice in [1, 2]
 
-            
             kite_swap_amount, swap_count = self.load_config()
             if kite_swap_amount == 0 or swap_count == 0:
                 self.log(f"{Fore.YELLOW+Style.BRIGHT}===== Bamar Airdrop Group ====={Style.RESET_ALL}")
@@ -491,18 +517,13 @@ class KiteAi:
                 self.log(f"{Fore.GREEN+Style.BRIGHT}Loaded config: KITE Amount = {kite_swap_amount}, Swap Count = {swap_count}{Style.RESET_ALL}")
 
             while True:
-                
                 await self.run_swaps(kite_swap_amount, swap_count, use_proxy)
-                
-                
                 next_run = datetime.now(wib) + timedelta(hours=24)
                 self.log(f"{Fore.CYAN+Style.BRIGHT}Next run scheduled at {next_run.strftime('%x %X %Z')}{Style.RESET_ALL}")
-                
-                
                 while datetime.now(wib) < next_run:
                     time_remaining = (next_run - datetime.now(wib)).total_seconds()
                     self.log(f"{Fore.CYAN+Style.BRIGHT}Time until next run: {self.format_time_remaining(time_remaining)}{Style.RESET_ALL}")
-                    await asyncio.sleep(60)  
+                    await asyncio.sleep(60)
         except Exception as e:
             self.log(f"{Fore.RED+Style.BRIGHT}Error in main: {str(e)}{Style.RESET_ALL}")
 
